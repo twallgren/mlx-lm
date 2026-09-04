@@ -10,6 +10,7 @@ from mlx.nn.layers.distributed import shard_linear
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 
 
@@ -148,7 +149,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class LlamaModel(nn.Module):
+class LlamaModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -181,18 +182,44 @@ class LlamaModel(nn.Module):
         else:
             h = self.embed_tokens(inputs)
 
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
-        fa_mask = create_attention_mask(h, cache[self.fa_idx])
-        if self.swa_idx is not None:
-            swa_mask = create_attention_mask(
-                h, cache[self.swa_idx], window_size=self.sliding_window
-            )
+        # Build the full-attention / sliding-window masks from whichever
+        # layers this rank actually owns (fa_idx/swa_idx are computed over
+        # the full, unsharded layer list at __init__ time and are no longer
+        # valid once pipeline() has truncated self.layers).
+        fa_mask = None
+        swa_mask = None
+        for c, layer in zip(cache, self.pipeline_layers):
+            if layer.use_sliding:
+                if swa_mask is None:
+                    swa_mask = create_attention_mask(
+                        h, c, window_size=self.sliding_window
+                    )
+            elif fa_mask is None:
+                fa_mask = create_attention_mask(h, c)
 
-        for layer, cache in zip(self.layers, cache):
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
+        for layer, c in zip(self.pipeline_layers, cache):
             mask = swa_mask if layer.use_sliding else fa_mask
-            h = layer(h, mask, cache=cache)
+            h = layer(h, mask, cache=c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache and cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -261,7 +288,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     def make_cache(self):
         return [
