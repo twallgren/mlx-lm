@@ -443,23 +443,47 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
+        r = group.rank()
+
+        def _rank_sizes(dim, N, block=1):
+            # Same remainder-distribution pattern used by
+            # PipelineMixin.pipeline(): the first `extra` ranks get one
+            # extra unit (or block, for group_size-aware quantized
+            # splits), the rest get the base amount. Reduces to an exactly
+            # even split whenever dim % (N * block) == 0.
+            n_blocks = dim // block
+            base = n_blocks // N
+            extra = n_blocks - base * N
+            return [(base + (1 if i < extra else 0)) * block for i in range(N)]
+
         for layer in self.model.layers:
+            attn = layer.self_attn
+            # MLA has no separate KV-head count -- every head reconstructs
+            # its own K/V from a shared low-rank latent via kv_b_proj, so
+            # (unlike GQA) heads can be distributed individually rather
+            # than in fixed-size groups.
+            head_sizes = _rank_sizes(attn.num_heads, N)
+            q_sizes = [s * attn.q_head_dim for s in head_sizes]
+            kv_out_head_dim = attn.q_head_dim - attn.qk_rope_head_dim + attn.v_head_dim
+            kv_sizes = [s * kv_out_head_dim for s in head_sizes]
+            o_sizes = [s * attn.v_head_dim for s in head_sizes]
+
             # Shard the self attention
-            if layer.self_attn.q_lora_rank is None:
-                layer.self_attn.q_proj = shard_linear(
-                    layer.self_attn.q_proj, "all-to-sharded", group=group
+            if attn.q_lora_rank is None:
+                attn.q_proj = shard_linear(
+                    attn.q_proj, "all-to-sharded", group=group, sizes=q_sizes
                 )
             else:
-                layer.self_attn.q_b_proj = shard_linear(
-                    layer.self_attn.q_b_proj, "all-to-sharded", group=group
+                attn.q_b_proj = shard_linear(
+                    attn.q_b_proj, "all-to-sharded", group=group, sizes=q_sizes
                 )
-            layer.self_attn.kv_b_proj = shard_linear(
-                layer.self_attn.kv_b_proj, "all-to-sharded", group=group
+            attn.kv_b_proj = shard_linear(
+                attn.kv_b_proj, "all-to-sharded", group=group, sizes=kv_sizes
             )
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
+            attn.o_proj = shard_linear(
+                attn.o_proj, "sharded-to-all", group=group, sizes=o_sizes
             )
-            layer.self_attn.num_heads //= N
+            attn.num_heads = head_sizes[r]
 
             # Shard the MLP
             if isinstance(layer.mlp, DeepseekV2MLP):

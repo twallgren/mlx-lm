@@ -339,22 +339,59 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
+        r = group.rank()
+
+        def _rank_sizes(dim, N, block=1):
+            # Same remainder-distribution pattern used by
+            # PipelineMixin.pipeline(): the first `extra` ranks get one
+            # extra unit (or block, for group_size-aware quantized
+            # splits), the rest get the base amount. Reduces to an exactly
+            # even split whenever dim % (N * block) == 0.
+            n_blocks = dim // block
+            base = n_blocks // N
+            extra = n_blocks - base * N
+            return [(base + (1 if i < extra else 0)) * block for i in range(N)]
+
         for layer in self.model.layers:
-            # Shard the self attention
-            layer.self_attn.q_proj = shard_linear(
-                layer.self_attn.q_proj, "all-to-sharded", group=group
+            attn = layer.self_attn
+            n_heads = attn.n_heads
+            n_kv_heads = attn.n_kv_heads
+            ratio = n_heads // n_kv_heads
+            # q_proj's pre-shard output rows are always n_heads * head_dim,
+            # for both plain and quantized linears (quantization only packs
+            # the input/column axis, not the output/row axis).
+            head_dim = attn.q_proj.weight.shape[0] // n_heads
+
+            # Distribute whole KV-head *groups* (each covering `ratio`
+            # query heads) across ranks, rather than distributing q_proj's
+            # and k_proj's/v_proj's output features independently. This
+            # keeps n_heads_local an exact multiple of n_kv_heads_local on
+            # every rank even when n_heads/n_kv_heads/N don't divide evenly
+            # among each other, so grouped-query-attention's local repeat
+            # of KV heads stays correct after uneven sharding.
+            kv_head_sizes = _rank_sizes(n_kv_heads, N)
+            q_head_sizes = [s * ratio for s in kv_head_sizes]
+            q_sizes = [s * head_dim for s in q_head_sizes]
+            kv_sizes = [s * head_dim for s in kv_head_sizes]
+
+            # Shard the self attention. o_proj's input sizes must match
+            # q_proj's output sizes exactly (same per-rank partition of the
+            # n_heads * head_dim dimension) so the local contraction before
+            # all_sum is consistent.
+            attn.q_proj = shard_linear(
+                attn.q_proj, "all-to-sharded", group=group, sizes=q_sizes
             )
-            layer.self_attn.k_proj = shard_linear(
-                layer.self_attn.k_proj, "all-to-sharded", group=group
+            attn.k_proj = shard_linear(
+                attn.k_proj, "all-to-sharded", group=group, sizes=kv_sizes
             )
-            layer.self_attn.v_proj = shard_linear(
-                layer.self_attn.v_proj, "all-to-sharded", group=group
+            attn.v_proj = shard_linear(
+                attn.v_proj, "all-to-sharded", group=group, sizes=kv_sizes
             )
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
+            attn.o_proj = shard_linear(
+                attn.o_proj, "sharded-to-all", group=group, sizes=q_sizes
             )
-            layer.self_attn.n_heads //= N
-            layer.self_attn.n_kv_heads //= N
+            attn.n_heads = q_head_sizes[r]
+            attn.n_kv_heads = kv_head_sizes[r]
 
             # Shard the MLP
             if isinstance(layer.mlp, MLP):
